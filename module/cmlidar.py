@@ -2,42 +2,50 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
+import torchvision.models as models
 
 
-# -------------------------
-# 简化版 ResNet backbone
-# -------------------------
-class ResNetBackbone(nn.Module):
-    def __init__(self, in_channels=3, base_channels=64):
-        super().__init__()
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(base_channels),
-            nn.ReLU(inplace=True),
-        )
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_channels * 2),
-            nn.ReLU(inplace=True),
-        )
-        self.layer3 = nn.Sequential(
-            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(base_channels * 4),
-            nn.ReLU(inplace=True),
-        )
-        self.out_channels = [base_channels, base_channels * 2, base_channels * 4]
+class ResNet34Features(nn.Module):
+    def __init__(self, ):
+        super(ResNet34Features, self).__init__()
+        # 加载 ResNet34
+        resnet = models.resnet34(weights=None)
+
+        # 拆分各个模块
+        self.conv1 = resnet.conv1  # 7x7 卷积
+        self.bn1 = resnet.bn1
+        self.relu = resnet.relu
+        self.maxpool = resnet.maxpool
+
+        self.layer1 = resnet.layer1  # ResNet34 的 4 个大层
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        self.avgpool = resnet.avgpool
+        self.fc = resnet.fc
 
     def forward(self, x):
-        f1 = self.layer1(x)  # [B, C, H/2, W/2]
-        f2 = self.layer2(f1)  # [B, 2C, H/4, W/4]
-        f3 = self.layer3(f2)  # [B, 4C, H/8, W/8]
-        return [f1, f2, f3]
+        outputs = {}  # 用字典存储各层输出，方便调用
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.maxpool(x)
+
+        x1 = self.layer1(x)
+
+        x2 = self.layer2(x1)
+
+        x3 = self.layer3(x2)
+
+        x4 = self.layer4(x3)
+
+        return [x1, x2, x3, x4]
 
 
-# -------------------------
-# PCT Block (Point Transformer)
-# -------------------------
-class PCTBlock(nn.Module):
+class GFEBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.fc1 = nn.Linear(in_channels, out_channels)
@@ -46,7 +54,8 @@ class PCTBlock(nn.Module):
 
     def forward(self, x, mask=None):
         # x: [B, N, C]
-        out = F.relu(self.fc1(x))
+        x = self.fc1(x)
+        out = F.relu(x)
         out = self.fc2(out)
         out = self.norm(out + x)  # 残差
         if mask is not None:
@@ -87,25 +96,27 @@ class PointCloudUpsampler(nn.Module):
     def __init__(self, img_dim=64, hidden_dim=128):
         super().__init__()
         # PCT编码
-        self.init_pcd = nn.Linear(3, hidden_dim)
-        self.pct1 = PCTBlock(hidden_dim, hidden_dim)
-        self.pct2 = PCTBlock(hidden_dim, hidden_dim)
-        self.pct3 = PCTBlock(hidden_dim, hidden_dim)
+        self.init_pcd = nn.Linear(3, 32)
+        self.pct1 = GFEBlock(32, 64)
+        self.pct2 = GFEBlock(64, 128)
+        self.pct3 = GFEBlock(128, 256)
+        self.pct4 = GFEBlock(256, 512)
 
         # Cross Attention
-        self.ca1 = CrossModalAttention(hidden_dim, img_dim, hidden_dim)
-        self.ca2 = CrossModalAttention(hidden_dim, img_dim * 2, hidden_dim)
-        self.ca3 = CrossModalAttention(hidden_dim, img_dim * 4, hidden_dim)
+        self.ca1 = CrossModalAttention(64, 64, 64)
+        self.ca2 = CrossModalAttention(128, 128, 128)
+        self.ca3 = CrossModalAttention(256, 256, 256)
+        self.ca4 = CrossModalAttention(512, 512, 512)
 
         # 上采样解码
-        self.up1 = nn.Linear(hidden_dim, hidden_dim)
-        self.up2 = nn.Linear(hidden_dim, hidden_dim)
-        self.up3 = nn.Linear(hidden_dim, hidden_dim)
+        self.up1 = nn.Linear(512, 256)
+        self.up2 = nn.Linear(256, 128)
+        self.up3 = nn.Linear(128, 64)
 
-        self.fc_out = nn.Linear(hidden_dim, 3)  # 输出 xyz
+        self.fc_out = nn.Linear(64, 12)  # 输出 xyz
 
         # RGB backbone
-        self.img_backbone = ResNetBackbone()
+        self.img_backbone = ResNet34Features()
 
     def forward(self, pc, img, mask=None):
         """
@@ -115,7 +126,7 @@ class PointCloudUpsampler(nn.Module):
         """
         B, N, _ = pc.shape
 
-        img_feats = self.img_backbone(img)  # [f1, f2, f3]
+        img_feats = self.img_backbone(img)
         img_flat = [f.flatten(2).transpose(1, 2) for f in img_feats]
 
         # 编码
@@ -130,14 +141,22 @@ class PointCloudUpsampler(nn.Module):
         x3 = self.pct3(x2, mask)
         x3 = self.ca3(x3, img_flat[2], mask)
 
+        x4 = self.pct4(x3, mask)
+        x4 = self.ca4(x4, img_flat[3], mask)
+
         # 逐层上采样
-        up1 = self.up1(x3) + x2
-        up2 = self.up2(up1) + x1
-        up3 = self.up3(up2)
+        up1 = self.up1(x4) + x3
+        up2 = self.up2(up1) + x2
+        up3 = self.up3(up2) + x1
 
         # 输出点云 (4N 个点)
         out = self.fc_out(up3)  # [B, N, 3]
-        out = out.repeat_interleave(4, dim=1)  # 扩展为 4N
+
+        # 步骤 1: 把最后的 12 reshape 成 (4, 3)
+        out = out.view(out.size(0), out.size(1), 4, 3)  # (B, N, 4, 3)
+
+        # 步骤 2: 把 N 和 4 合并
+        out = out.view(out.size(0), out.size(1) * 4, 3)  # (B, 4N, 3)
         if mask is not None:
             mask = mask.repeat_interleave(4, dim=1)
             out = out * mask.unsqueeze(-1)
@@ -179,7 +198,7 @@ if __name__ == "__main__":
         transforms.Resize(selected_size),
         transforms.ToTensor()
     ])
-    model = PointCloudUpsampler(transform=transform)
+    model = PointCloudUpsampler()
     out = model(pts, imgs, masks)
     print("输入点云:", pts.shape)
     print("输入RGB:", imgs.shape)
