@@ -6,10 +6,18 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class LiDARnpzDataset(Dataset):
-    def __init__(self, dataset_root, transform=None):
-        self.files = [os.path.join(dataset_root, f)
-                      for f in os.listdir(dataset_root) if f.endswith(".npz")]
-        self.files.sort()
+    def __init__(self, dataset_root, train=True, train_ratio=0.6, transform=None):
+        # 收集所有 npz 文件
+        all_files = [os.path.join(dataset_root, f) for f in os.listdir(dataset_root) if f.endswith(".npz")]
+        all_files.sort()
+
+        # 按比例划分
+        split_idx = int(len(all_files) * train_ratio)
+        if train:
+            self.files = all_files[:split_idx]  # 训练集
+        else:
+            self.files = all_files[split_idx:]  # 测试集
+
         self.transform = transform
 
     def __len__(self):
